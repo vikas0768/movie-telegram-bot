@@ -11,21 +11,31 @@ dotenv.config();
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = process.env.ADMIN_ID;
 const PORT = process.env.PORT || 10000;
-const RENDER_URL = process.env.RENDER_URL;  
+
+// If RENDER_URL not set, auto-generate it using Render's dynamic hostname
+const RENDER_URL = process.env.RENDER_URL || `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`;
 
 const DEFAULT_EXP_HOURS = 8;
 
-if (!BOT_TOKEN || !RENDER_URL) {
-  console.error("Missing BOT_TOKEN or RENDER_URL");
+// REQUIRED ENV CHECK
+if (!BOT_TOKEN) {
+  console.error("❌ Missing BOT_TOKEN in environment.");
   process.exit(1);
 }
+
+if (!RENDER_URL) {
+  console.error("❌ Missing RENDER_URL or Render external hostname.");
+  process.exit(1);
+}
+
+console.log("➡ Using webhook URL:", RENDER_URL);
 
 const app = express();
 const bot = new Telegraf(BOT_TOKEN);
 
 let db;
 
-/* ------ DB SETUP ------ */
+/* ---------- DB INIT ---------- */
 async function initDb() {
   db = await open({
     filename: "./moviebot.db",
@@ -50,11 +60,12 @@ async function initDb() {
   )`);
 }
 
-/* ----- AUTO DELETE SCHEDULER ---- */
+/* ---------- AUTO-DELETE SCHEDULER ---------- */
 const tasks = new Map();
 
 function scheduleDelete(row) {
   const ms = row.expire_at * 1000 - Date.now();
+
   if (ms <= 0) return deleteNow(row);
 
   const t = setTimeout(() => deleteNow(row), ms);
@@ -64,7 +75,7 @@ function scheduleDelete(row) {
 async function deleteNow(row) {
   try {
     await bot.telegram.deleteMessage(row.chat_id, row.message_id);
-  } catch (e) {}
+  } catch {}
   await db.run(`DELETE FROM deliveries WHERE id=?`, [row.id]);
   tasks.delete(row.id);
 }
@@ -74,60 +85,61 @@ async function loadTasks() {
   rows.forEach(scheduleDelete);
 }
 
-/* ====== ADMIN CHECK ====== */
+/* ---------- ADMIN CHECK ---------- */
 function isAdmin(ctx) {
   return ctx.from && String(ctx.from.id) === String(ADMIN_ID);
 }
 
-/* ========== BOT LOGIC ========== */
+/* ---------- BOT LOGIC ---------- */
 
 bot.start(async (ctx) => {
   const key = ctx.startPayload;
-  if (!key) return ctx.reply("Open movies from the app only.");
 
-  const m = await db.get(`SELECT * FROM movies WHERE key=?`, [key]);
-  if (!m) return ctx.reply("Movie not found.");
+  if (!key) return ctx.reply("Open movie from your app.");
+
+  const movie = await db.get(`SELECT * FROM movies WHERE key=?`, [key]);
+  if (!movie) return ctx.reply("Movie not found.");
 
   try {
-    const send = await ctx.replyWithVideo(m.telegram_file_id, {
-      caption: `${m.title}\n(Delivered by MovieLink Bot)`,
+    const send = await ctx.replyWithVideo(movie.telegram_file_id, {
+      caption: `${movie.title}\n(Delivered by Movie Bot)`,
       supports_streaming: true
     });
 
     const now = Math.floor(Date.now() / 1000);
-    const exp = now + (m.expire_hours * 3600);
+    const exp = now + (movie.expire_hours * 3600);
 
     const res = await db.run(
-      `INSERT INTO deliveries (chat_id,message_id,movie_key,delivered_at,expire_at) 
+      `INSERT INTO deliveries (chat_id,message_id,movie_key,delivered_at,expire_at)
        VALUES (?,?,?,?,?)`,
-      [send.chat.id, send.message_id, m.key, now, exp]
+      [send.chat.id, send.message_id, movie.key, now, exp]
     );
 
-    scheduleDelete({ 
-      id: res.lastID, 
-      chat_id: send.chat.id, 
-      message_id: send.message_id, 
-      expire_at: exp 
+    scheduleDelete({
+      id: res.lastID,
+      chat_id: send.chat.id,
+      message_id: send.message_id,
+      expire_at: exp
     });
 
-  } catch (e) {
-    return ctx.reply("Failed to send movie.");
+  } catch {
+    ctx.reply("Failed to send movie.");
   }
 });
 
-/* BLOCK NORMAL USERS */
+/* ---------- BLOCK NORMAL USERS ---------- */
 bot.on("message", (ctx, next) => {
   if (isAdmin(ctx)) return next();
-  return ctx.reply("Use the app link to watch movies.");
+  return ctx.reply("Movies only work through the app.");
 });
 
-/* ===== ADMIN COMMANDS ===== */
+/* ---------- ADMIN COMMANDS ---------- */
 
 bot.command("addmovie", async (ctx) => {
   if (!isAdmin(ctx)) return;
 
-  const raw = ctx.message.text.replace("/addmovie", "").trim();
-  const p = raw.split("|").map(s => s.trim());
+  const r = ctx.message.text.replace("/addmovie", "").trim();
+  const p = r.split("|").map(s => s.trim());
 
   if (p.length < 3)
     return ctx.reply("Usage: /addmovie KEY | Title | file_id | hours");
@@ -135,16 +147,16 @@ bot.command("addmovie", async (ctx) => {
   const key = p[0];
   const title = p[1];
   const fid = p[2];
-  const hours = p[3] ? Number(p[3]) : DEFAULT_EXP_HOURS;
+  const hrs = p[3] ? Number(p[3]) : DEFAULT_EXP_HOURS;
 
   await db.run(
-    `INSERT OR REPLACE INTO movies (key,title,telegram_file_id,expire_hours) 
+    `INSERT OR REPLACE INTO movies (key,title,telegram_file_id,expire_hours)
      VALUES (?,?,?,?)`,
-    [key, title, fid, hours]
+    [key, title, fid, hrs]
   );
 
   const me = await bot.telegram.getMe();
-  ctx.reply(`Movie added\nLink: https://t.me/${me.username}?start=${key}`);
+  ctx.reply(`Movie added!\nLink: https://t.me/${me.username}?start=${key}`);
 });
 
 bot.command("delmovie", async (ctx) => {
@@ -161,26 +173,31 @@ bot.command("listmovies", async (ctx) => {
   ctx.reply(rows.map(r => `• ${r.key} — ${r.title}`).join("\n"));
 });
 
-/* ===== FILE-ID PICKER (Admin upload) ===== */
+/* ---------- ADMIN VIDEO UPLOAD (GET FILE ID) ---------- */
 bot.on("video", async (ctx) => {
   if (!isAdmin(ctx)) return;
   ctx.reply("File ID:\n" + ctx.message.video.file_id);
 });
 
-/* ====== WEBHOOK SETUP ====== */
+/* ---------- WEBHOOK SETUP ---------- */
 
-const secret = `/webhook/${BOT_TOKEN}`;
-bot.telegram.setWebhook(`${RENDER_URL}${secret}`);
-app.use(bot.webhookCallback(secret));
+const path = `/webhook/${BOT_TOKEN}`;
+const fullWebhookURL = `${RENDER_URL}${path}`;
 
-app.get("/", (req, res) => res.send("Movie Bot Running"));
+bot.telegram.setWebhook(fullWebhookURL);
+app.use(bot.webhookCallback(path));
 
-/* ===== START SERVER ===== */
+app.get("/", (req, res) => res.send("MovieBot Online (Webhook Mode)"));
+
+
+/* ---------- START SERVER ---------- */
 (async () => {
   await initDb();
   await loadTasks();
 
   app.listen(PORT, () => {
-    console.log("Server live on port", PORT);
+    console.log("✅ Webhook server running on:", PORT);
+    console.log("🌐 Webhook URL:", fullWebhookURL);
   });
 })();
+
