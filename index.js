@@ -16,25 +16,14 @@ const ADMIN_ID = process.env.ADMIN_ID;
 const CHANNEL_ID = process.env.CHANNEL_ID; // example: -1001234567890
 const PORT = process.env.PORT || 10000;
 
-// Render auto hostname support
 const RENDER_URL =
   process.env.RENDER_URL ||
   `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`;
 
-const DEFAULT_EXP_HOURS = 8;
-
-// ENV CHECK
 if (!BOT_TOKEN || !CHANNEL_ID) {
   console.error("❌ Missing BOT_TOKEN or CHANNEL_ID");
   process.exit(1);
 }
-
-if (!RENDER_URL) {
-  console.error("❌ Missing RENDER_URL or Render external hostname");
-  process.exit(1);
-}
-
-console.log("➡ Webhook URL:", RENDER_URL);
 
 const app = express();
 const bot = new Telegraf(BOT_TOKEN);
@@ -51,7 +40,6 @@ async function initDb() {
   await db.exec(`CREATE TABLE IF NOT EXISTS movies (
     key TEXT PRIMARY KEY,
     title TEXT NOT NULL,
-    channel_msg_id INTEGER NOT NULL,
     telegram_file_id TEXT NOT NULL,
     expire_hours INTEGER DEFAULT 8,
     added_at INTEGER DEFAULT (strftime('%s','now'))
@@ -68,14 +56,11 @@ async function initDb() {
 }
 
 /* ---------- AUTO DELETE ---------- */
-const tasks = new Map();
-
-function scheduleDelete(row) {
+async function scheduleDelete(row) {
   const ms = row.expire_at * 1000 - Date.now();
   if (ms <= 0) return deleteNow(row);
 
-  const t = setTimeout(() => deleteNow(row), ms);
-  tasks.set(row.id, t);
+  setTimeout(() => deleteNow(row), ms);
 }
 
 async function deleteNow(row) {
@@ -83,12 +68,6 @@ async function deleteNow(row) {
     await bot.telegram.deleteMessage(row.chat_id, row.message_id);
   } catch {}
   await db.run(`DELETE FROM deliveries WHERE id=?`, [row.id]);
-  tasks.delete(row.id);
-}
-
-async function loadTasks() {
-  const rows = await db.all(`SELECT * FROM deliveries`);
-  rows.forEach(scheduleDelete);
 }
 
 /* ---------- ADMIN CHECK ---------- */
@@ -96,11 +75,10 @@ function isAdmin(ctx) {
   return ctx.from && String(ctx.from.id) === String(ADMIN_ID);
 }
 
-/* ---------- USER MOVIE DELIVERY ---------- */
+/* ---------- SEND MOVIE TO USER ---------- */
 
 bot.start(async (ctx) => {
   const key = ctx.startPayload;
-
   if (!key) return ctx.reply("Open this movie from your app.");
 
   const movie = await db.get(`SELECT * FROM movies WHERE key=?`, [key]);
@@ -113,22 +91,21 @@ bot.start(async (ctx) => {
     });
 
     const now = Math.floor(Date.now() / 1000);
-    const exp = now + movie.expire_hours * 3600;
+    const expire_at = now + movie.expire_hours * 3600;
 
-    const add = await db.run(
+    const r = await db.run(
       `INSERT INTO deliveries (chat_id,message_id,movie_key,expire_at)
        VALUES (?,?,?,?)`,
-      [sent.chat.id, sent.message_id, movie.key, exp]
+      [sent.chat.id, sent.message_id, movie.key, expire_at]
     );
 
     scheduleDelete({
-      id: add.lastID,
+      id: r.lastID,
       chat_id: sent.chat.id,
       message_id: sent.message_id,
-      expire_at: exp,
+      expire_at,
     });
-
-  } catch {
+  } catch (e) {
     ctx.reply("Failed to send movie.");
   }
 });
@@ -136,14 +113,15 @@ bot.start(async (ctx) => {
 /* ---------- BLOCK NORMAL USERS ---------- */
 bot.on("message", (ctx, next) => {
   if (isAdmin(ctx)) return next();
-  return ctx.reply("Use the app only.");
+  return ctx.reply("Use the app to get movies.");
 });
 
-/* ---------- ADMIN ADD MOVIE (AUTO FILE ID FROM CHANNEL) ---------- */
+/* ---------- ADMIN: ADD MOVIE ---------- */
 /*
 Usage:
- /addmovie KEY | Title | CHANNEL_MESSAGE_ID | hours(optional)
+ /addmovie KEY | Title | ChannelMsgID | hours(optional)
 */
+
 bot.command("addmovie", async (ctx) => {
   if (!isAdmin(ctx)) return;
 
@@ -158,64 +136,52 @@ bot.command("addmovie", async (ctx) => {
   const key = p[0];
   const title = p[1];
   const msgId = Number(p[2]);
-  const hours = p[3] ? Number(p[3]) : DEFAULT_EXP_HOURS;
+  const hours = p[3] ? Number(p[3]) : 8;
 
   try {
-    const channelMsg = await bot.telegram.getChat(CHANNEL_ID);
+    // Get the message from channel
+    const message = await bot.telegram.forwardMessage(
+      ADMIN_ID,
+      CHANNEL_ID,
+      msgId
+    );
 
-    const data = await bot.telegram.getChat(CHANNEL_ID);
-
-    const message = await bot.telegram.getMessage(CHANNEL_ID, msgId);
     const video = message.video;
-
-    if (!video) return ctx.reply("❌ Message ID does not contain a video.");
+    if (!video)
+      return ctx.reply("❌ The ChannelMsgID selected does NOT contain a video.");
 
     const file_id = video.file_id;
 
     await db.run(
-      `INSERT OR REPLACE INTO movies (key,title,channel_msg_id,telegram_file_id,expire_hours)
-       VALUES (?,?,?,?,?)`,
-      [key, title, msgId, file_id, hours]
+      `INSERT OR REPLACE INTO movies (key,title,telegram_file_id,expire_hours)
+       VALUES (?,?,?,?)`,
+      [key, title, file_id, hours]
     );
 
     const me = await bot.telegram.getMe();
-
     ctx.reply(
-      `✔ Movie Added!\n\n🔗 Link:\nhttps://t.me/${me.username}?start=${key}`
+      `✔ Movie Added!\n\n🔗 User Link:\nhttps://t.me/${me.username}?start=${key}`
     );
-
   } catch (err) {
     console.log(err);
-    ctx.reply("❌ Failed! Wrong ChannelMsgID?");
+    ctx.reply("❌ Failed! Wrong ChannelMsgID or bot is not admin in channel.");
   }
 });
 
-bot.command("listmovies", async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const rows = await db.all(`SELECT * FROM movies ORDER BY added_at DESC`);
-  if (!rows.length) return ctx.reply("No movies.");
-  ctx.reply(rows.map((r) => `• ${r.key} — ${r.title}`).join("\n"));
-});
-
 /* ---------- WEBHOOK ---------- */
-const path = `/webhook/${BOT_TOKEN}`;
-const webhookURL = `${RENDER_URL}${path}`;
 
-bot.telegram.setWebhook(webhookURL);
+const path = `/webhook/${BOT_TOKEN}`;
+bot.telegram.setWebhook(`${RENDER_URL}${path}`);
 app.use(bot.webhookCallback(path));
 
-app.get("/", (req, res) => res.send("MovieBot Online (Webhook)"));
+app.get("/", (req, res) => res.send("MovieBot Online"));
 
-/* ---------- START SERVER ---------- */
+/* ---------- START ---------- */
+
 (async () => {
   await initDb();
-  await loadTasks();
-
   app.listen(PORT, () => {
-    console.log("✅ Running on port", PORT);
-    console.log("🌐 Webhook URL:", webhookURL);
+    console.log("Bot running:", PORT);
   });
 })();
-
-
 
